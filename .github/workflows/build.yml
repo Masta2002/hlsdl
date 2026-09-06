@@ -6,7 +6,7 @@ jobs:
   build-macos:
 
     runs-on: macOS-latest
-    
+
     steps:
     - uses: actions/checkout@v1
     - name: make
@@ -14,12 +14,18 @@ jobs:
     - name: download testfile
       run: ./hlsdl -b -o test.ts "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_4x3/bipbop_4x3_variant.m3u8"
     - name: verify testfile
-      run: echo "6bf11a9a4be02443d4790e43e6569a614128bad453c5cb327ec74031f6ea6382  test.ts" | shasum -a256 -c 
+      run: echo "6bf11a9a4be02443d4790e43e6569a614128bad453c5cb327ec74031f6ea6382  test.ts" | shasum -a256 -c
+    - name: download fmp4 testfile (EXT-X-MAP + BYTERANGE)
+      run: ./hlsdl -b -o test_fmp4.mp4 "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"
+    - name: verify fmp4 testfile starts with an ftyp box
+      run: |
+        test -s test_fmp4.mp4
+        dd if=test_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
 
   build-ubuntu:
 
     runs-on: ubuntu-latest
-    
+
     steps:
     - uses: actions/checkout@v1
     - name: update apt
@@ -31,4 +37,10 @@ jobs:
     - name: download testfile
       run: ./hlsdl -b -o test.ts "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_4x3/bipbop_4x3_variant.m3u8"
     - name: verify testfile
-      run: echo "6bf11a9a4be02443d4790e43e6569a614128bad453c5cb327ec74031f6ea6382  test.ts" | shasum -a256 -c 
+      run: echo "6bf11a9a4be02443d4790e43e6569a614128bad453c5cb327ec74031f6ea6382  test.ts" | shasum -a256 -c
+    - name: download fmp4 testfile (EXT-X-MAP + BYTERANGE)
+      run: ./hlsdl -b -o test_fmp4.mp4 "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"
+    - name: verify fmp4 testfile starts with an ftyp box
+      run: |
+        test -s test_fmp4.mp4
+        dd if=test_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp

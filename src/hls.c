@@ -242,7 +242,7 @@ static int extend_url(char **url, const char *baseurl)
     }
 }
 
-static void semgemnt_list_append(hls_media_segment_t** first, hls_media_segment_t** last, hls_media_segment_t* ms)
+static void segment_list_append(hls_media_segment_t** first, hls_media_segment_t** last, hls_media_segment_t* ms)
 {
     if (*first == NULL)
     {
@@ -306,7 +306,7 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
             
             hls_media_segment_t* map = malloc(sizeof(struct hls_media_segment));
             memset(map, 0x00, sizeof(struct hls_media_segment));
-            semgemnt_list_append(&me->first_media_segment, &me->last_media_segment, map);
+            segment_list_append(&me->first_media_segment, &me->last_media_segment, map);
                 
             map->url = strndup(tag, end_pos - tag);
             map->is_map = true;
@@ -353,11 +353,14 @@ static void setup_segment_aes(hls_media_playlist_t *me, hls_media_segment_t *ms)
     if (me->encryptiontype == ENC_AES128 || me->encryptiontype == ENC_AES_SAMPLE) {
         memcpy(ms->enc_aes.key_value, me->enc_aes.key_value, KEYLEN);
         memcpy(ms->enc_aes.iv_value, me->enc_aes.iv_value, KEYLEN);
-        ms->enc_aes.key_url = strdup(me->enc_aes.key_url);        
+        ms->enc_aes.key_url = strdup(me->enc_aes.key_url);
         if (me->enc_aes.iv_is_static == false) {
+            /* For an EXT-X-MAP segment sequence_number is the sequence number
+             * of the first Media Segment that follows it, which is also the
+             * IV mandated by RFC 8216 for that initialization section. */
             char iv_str[STRLEN_BTS(KEYLEN)];
-            snprintf(iv_str, STRLEN_BTS(KEYLEN), "%032x\n", ms->sequence_number); // is this correct for map segments?
-            uint8_t *iv_bin[KEYLEN];
+            uint8_t iv_bin[KEYLEN];
+            snprintf(iv_str, STRLEN_BTS(KEYLEN), "%032x\n", ms->sequence_number);
             str_to_bin(iv_bin, iv_str, KEYLEN);
             memcpy(ms->enc_aes.iv_value, iv_bin, KEYLEN);
         }
@@ -369,7 +372,6 @@ static int media_playlist_get_links(hls_media_playlist_t *me)
     struct hls_media_segment *map = NULL;
     struct hls_media_segment *ms = NULL;
     char *src = me->source;
-    char* map_uri = NULL;
     int64_t seg_offset = 0;
     int64_t seg_size = -1;
 
@@ -394,12 +396,13 @@ static int media_playlist_get_links(hls_media_playlist_t *me)
             if (*src == '#') {
                 parse_tag(me, ms, src, &seg_offset, &seg_size);
                 
-                if (me->last_media_segment && me->last_media_segment->is_map) { // new map was given
+                if (me->last_media_segment && me->last_media_segment->is_map
+                        && me->last_media_segment != map) { // a new EXT-X-MAP was just parsed
                     map = me->last_media_segment;
-                    
+
                     map->sequence_number = i + me->first_media_sequence;
                     setup_segment_aes(me, map);
-                    
+
                     /* Get full url */
                     extend_url(&(map->url), me->url);
                 }
@@ -437,7 +440,7 @@ static int media_playlist_get_links(hls_media_playlist_t *me)
                 }
 
                 /* Add new segment to segment list */
-                semgemnt_list_append(&(me->first_media_segment), &(me->last_media_segment), ms);
+                segment_list_append(&(me->first_media_segment), &(me->last_media_segment), ms);
                 ms = NULL;
                 i += 1;
                 break;
@@ -1280,7 +1283,14 @@ static void *hls_playlist_update_thread(void *arg)
                     // add new segments
                     struct hls_media_segment *ms = new_me.first_media_segment;
                     while (ms) {
-                        if (ms->sequence_number > me->last_media_sequence || ms->is_map) {
+                        /* Only splice in genuinely new media segments. The
+                         * initialization segment (EXT-X-MAP) was already queued
+                         * by the first media_playlist_get_links() call and
+                         * written before the first part; re-queuing the whole
+                         * window on every refresh would re-download it all. A
+                         * mid-stream change of the init segment (discontinuity)
+                         * is not handled. */
+                        if (!ms->is_map && ms->sequence_number > me->last_media_sequence) {
                             if (ms->prev) {
                                 ms->prev->next = NULL;
                             }
@@ -1401,8 +1411,8 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
     void *session = init_hls_session();
     set_timeout_session(session, 2L, 3L);
     char* current_map_url = NULL;
-    uint64_t current_map_offset = 0;
-    uint64_t current_map_size = -1;
+    int64_t current_map_offset = 0;
+    int64_t current_map_size = -1;
     uint64_t downloaded_duration_ms = 0;
     int64_t download_size = 0;
     time_t repTime = 0;
@@ -1459,7 +1469,9 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
                 first_media_sequence = me->first_media_sequence;
                 pthread_mutex_unlock(&media_playlist_mtx);
 
-                if(http_code != 403 && http_code != 401 &&  http_code != 410 && (retries <= hls_args.segment_download_retries && ms->sequence_number > first_media_sequence || ms->is_map)) {
+                if (http_code != 403 && http_code != 401 && http_code != 410
+                        && retries <= hls_args.segment_download_retries
+                        && (ms->sequence_number > first_media_sequence || ms->is_map)) {
                     clean_http_session(session);
                     sleep(1);
                     session = init_hls_session();
@@ -1542,7 +1554,11 @@ static int vod_download_segment(void **psession, hls_media_playlist_t *me, struc
     int retries = 0;
     int ret = 0;
     while (true) {
-        MSG_PRINT("Downloading part %d\n", ms->sequence_number);
+        if (ms->is_map) {
+            MSG_PRINT("Downloading init segment %s\n", ms->url);
+        } else {
+            MSG_PRINT("Downloading part %d\n", ms->sequence_number);
+        }
 
         memset(seg, 0x00, sizeof(*seg));
         size_t size = 0;
@@ -1654,6 +1670,28 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     }
 
     while(ms) {
+        /* fMP4 initialization segment (EXT-X-MAP): write it verbatim, never run
+         * it through the TS packet scanner or the audio/video merge, and do not
+         * consume a segment from the other playlist for it. */
+        if (ms->is_map) {
+            if (0 != vod_download_segment(&session, me, ms, &seg)) {
+                break;
+            }
+            download_size += out_ctx->write(seg.data, seg.len, out_ctx->opaque);
+            free(seg.data);
+            ms = ms->next;
+            continue;
+        }
+        if (ms_audio && ms_audio->is_map) {
+            if (0 != vod_download_segment(&session, me_audio, ms_audio, &seg_audio)) {
+                break;
+            }
+            download_size += out_ctx->write(seg_audio.data, seg_audio.len, out_ctx->opaque);
+            free(seg_audio.data);
+            ms_audio = ms_audio->next;
+            continue;
+        }
+
         if (0 != vod_download_segment(&session, me, ms, &seg)) {
             break;
         }
