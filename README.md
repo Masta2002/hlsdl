@@ -11,7 +11,7 @@ This program requires libcurl and libcrypto libraries.
 Build
 -----
 
-![hlsdl build](https://github.com/selsta/hlsdl/workflows/hlsdl%20build/badge.svg)
+[![hlsdl build](https://github.com/selsta/hlsdl/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/selsta/hlsdl/actions/workflows/build.yml)
 
 Linux:
 `make && make install && make clean`
