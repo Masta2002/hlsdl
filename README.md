@@ -1,7 +1,7 @@
 hlsdl
 =====
 
-This program converts .m3u8 playlists (using fragmented MPEG-2 Transport Streams) to a .ts video. It supports decryption of both AES-128 and SAMPLE-AES encryption.
+This program downloads VOD and live .m3u8 (HLS) streams to a single file. It handles MPEG-2 Transport Stream and fragmented MP4 / CMAF segments, `EXT-X-MAP` initialization segments (fMP4 and TS), `EXT-X-BYTERANGE`, discontinuities, and decryption of both AES-128 and SAMPLE-AES.
 
 Requirements
 ------------
@@ -82,11 +82,6 @@ docker run -v ./data:/var/hlsdl/data --rm -it hlsdl:latest hlsdl [options] url
 
 -C ... the file name of file holding cookie data in the old Netscape / Mozilla cookie data format.
 ```
-
-ToDo
------
-* support for Fragmented MPEG-4 playlist
-* support for EXT-X-MAP in the MPEG-2 Transport Streams playlist
 
 Ideas
 -----
