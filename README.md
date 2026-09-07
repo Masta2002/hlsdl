@@ -56,6 +56,8 @@ docker run -v ./data:/var/hlsdl/data --rm -it hlsdl:latest hlsdl [options] url
 
 -f ... Force overwriting the output file.
 
+-R ... Resume an interrupted VOD download (keeps a <output>.hlsdl.resume sidecar).
+
 -F ... Force ignore detection of DRM.
 
 -K ... Force AES key value (hexstring)
