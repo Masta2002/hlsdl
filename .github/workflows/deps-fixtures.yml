@@ -1,0 +1,1468 @@
+name: e2iplayer-deps fixtures
+
+on: [push]
+
+jobs:
+  hlsdl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get -y install libcurl4-openssl-dev libssl-dev ffmpeg
+      - name: make
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
+      - name: TS stream (AES-128, muxed)
+        if: always()
+        run: |
+          timeout 180 ./build/hlsdl -b -o test.ts "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_4x3/bipbop_4x3_variant.m3u8"
+          echo "6bf11a9a4be02443d4790e43e6569a614128bad453c5cb327ec74031f6ea6382  test.ts" | sha256sum -c
+      # Needs the current hlsdl (EXT-X-MAP support). Against the old bundled
+      # 0.26 this step fails - that is the point.
+      - name: fMP4 stream (EXT-X-MAP + BYTERANGE)
+        if: always()
+        run: |
+          set -eux
+          # the -b variant (v9) carries #EXT-X-MAP:URI="main.mp4",BYTERANGE="721@0"
+          # into a ~585 MB progressive file; a broken quote-skip makes hlsdl pull
+          # that whole file in as the "init segment" AND append the byte ranges.
+          timeout 300 ./build/hlsdl -b -o test_fmp4.mp4 "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"
+          test -s test_fmp4.mp4
+          dd if=test_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          bytes=$(stat -c%s test_fmp4.mp4)
+          test "$bytes" -gt 50000000
+          test "$bytes" -lt 800000000
+          # ffprobe reads the whole file; -b takes the audio rendition of the
+          # variant, and fMP4 + separate audio is muxed into one file with both
+          # tracks (v0.37) - before, the output had no sound
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 test_fmp4.mp4 > streams.txt
+          cat streams.txt
+          grep -qE '^video' streams.txt
+          grep -qE '^audio' streams.txt
+          apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 test_fmp4.mp4 | head -1 | cut -d, -f1)
+          test "$apk" -gt 1000
+      # Locally generated fixtures - deterministic, no network. Split into one
+      # step per case so a failure points straight at the fixture that broke.
+      - name: fixture - fMP4 EXT-X-MAP (separate init file)
+        if: always()
+        run: |
+          set -eux
+          mkdir fx && cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=6:s=128x72 -c:v libx264 -g 15 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 fmp4.m3u8
+          cat fmp4.m3u8
+          timeout 60 ../build/hlsdl -f -o out_fmp4.mp4 fmp4.m3u8
+          dd if=out_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          test "$(grep -a -o ftyp out_fmp4.mp4 | wc -l)" -eq 1
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_fmp4.mp4 | grep -q video
+      - name: fixture - single-file fMP4 (EXT-X-MAP BYTERANGE, local path)
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # concat the init + fragments into one file and hand-write a byte-range
+          # playlist: #EXT-X-MAP:URI="blob.mp4",BYTERANGE="<n>@0" (quoted, unlike
+          # #EXT-X-BYTERANGE). A broken quote-skip reads size 0 -> local 404.
+          segs=$(grep -v '^#' fmp4.m3u8)
+          cat init.mp4 $segs > blob.mp4
+          isz=$(stat -c%s init.mp4)
+          {
+            printf '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n'
+            printf '#EXT-X-MAP:URI="blob.mp4",BYTERANGE="%d@0"\n' "$isz"
+            off=$isz
+            for s in $segs; do
+              sz=$(stat -c%s "$s")
+              printf '#EXTINF:1.0,\n#EXT-X-BYTERANGE:%d@%d\nblob.mp4\n' "$sz" "$off"
+              off=$((off + sz))
+            done
+            printf '#EXT-X-ENDLIST\n'
+          } > sf.m3u8
+          cat sf.m3u8
+          timeout 60 ../build/hlsdl -f -o out_sf.mp4 sf.m3u8
+          dd if=out_sf.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          # hlsdl just re-reads the byte ranges in order -> exactly blob.mp4
+          cmp -s out_sf.mp4 blob.mp4
+      - name: fixture - live fMP4, -s 0 keeps the EXT-X-MAP
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # a live playlist (no ENDLIST); 2 s segments so -i 1 stops hlsdl
+          # cleanly (exit 0, file flushed) right after the first trimmed
+          # segment instead of spinning until a timeout kill
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' fmp4.m3u8 > live_fmp4.m3u8
+          cat live_fmp4.m3u8
+          python3 -m http.server 8199 &
+          srv=$!
+          sleep 1
+          timeout 30 ../build/hlsdl -f -s 0 -i 1 -e 1 -o out_live_fmp4.mp4 "http://127.0.0.1:8199/live_fmp4.m3u8" || true
+          kill $srv 2>/dev/null || true
+          ls -l out_live_fmp4.mp4
+          # -i 1 stops hlsdl right after the init segment, before the first
+          # trimmed media segment is written -> the output must be exactly the
+          # EXT-X-MAP init. A broken trim frees that head and the output starts
+          # with a media fragment (styp / no ftyp) instead.
+          dd if=out_live_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          cmp -s out_live_fmp4.mp4 init.mp4
+      - name: fixture - repeated and changing EXT-X-MAP (VOD, live refresh, live -s trim)
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          segs=$(grep -v '^#' fmp4.m3u8)
+          test "$(echo $segs | wc -w)" -ge 2
+          s0=$(echo $segs | cut -d' ' -f1)
+          hdr7='#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n'
+          # VOD: the map repeated before every segment, once under another URL
+          # with the same bytes - the init must be in the file exactly once
+          cp init.mp4 init_copy.mp4
+          {
+            printf "$hdr7"
+            n=0
+            for s in $segs; do
+              if [ $n -eq 1 ]; then
+                printf '#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI="init_copy.mp4"\n'
+              else
+                printf '#EXT-X-MAP:URI="init.mp4"\n'
+              fi
+              printf '#EXTINF:2.0,\n%s\n' "$s"
+              n=$((n + 1))
+            done
+            printf '#EXT-X-ENDLIST\n'
+          } > rep.m3u8
+          cat rep.m3u8
+          timeout 60 ../build/hlsdl -f -o out_rep.mp4 rep.m3u8
+          cmp out_rep.mp4 out_fmp4.mp4
+          # a second, different init
+          ffmpeg -v error -f lavfi -i testsrc2=d=4:s=96x64 -c:v libx264 -g 15 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename init2.mp4 \
+                 -hls_segment_filename 'b%d.m4s' fmp4b.m3u8
+          ! cmp -s init.mp4 init2.mp4
+          b0=$(grep -v '^#' fmp4b.m3u8 | sed -n 1p)
+          b1=$(grep -v '^#' fmp4b.m3u8 | sed -n 2p)
+          test -n "$b1"
+          python3 -m http.server 8201 &
+          srv=$!
+          printf "$hdr7" > live_map.m3u8
+          printf '#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2.0,\n%s\n' "$s0" >> live_map.m3u8
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8201/live_map.m3u8 && break
+            sleep 0.5
+          done
+          # live: a new init after a discontinuity, right in front of the new
+          # segment - the refresh used to drop it
+          timeout 30 ../build/hlsdl -f -s 30 -e 1 -o out_live_map.mp4 "http://127.0.0.1:8201/live_map.m3u8" 2>live_map.log &
+          dl=$!
+          # change the playlist only once hlsdl is through the first window
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 0' live_map.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI="init2.mp4"\n#EXTINF:2.0,\n%s\n#EXT-X-ENDLIST\n' "$b0" >> live_map.m3u8
+          rc=0
+          wait $dl || rc=$?
+          # live -s: the window holds two inits and the start lies after the
+          # second - the trim used to keep the first one. The start is at least
+          # three target durations before the end (v0.37): TARGETDURATION:1 puts
+          # it at b0, after the second init.
+          {
+            printf "$hdr7" | sed 's/TARGETDURATION:2/TARGETDURATION:1/'
+            printf '#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2.0,\n%s\n' "$s0"
+            printf '#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI="init2.mp4"\n#EXTINF:2.0,\n%s\n#EXTINF:2.0,\n%s\n' "$b0" "$b1"
+          } > live_trim.m3u8
+          # -i 1 stops right after the init in force at the start
+          timeout 30 ../build/hlsdl -f -s 1 -i 1 -e 1 -o out_live_trim.mp4 "http://127.0.0.1:8201/live_trim.m3u8" || true
+          kill $srv 2>/dev/null || true
+          test "$rc" -eq 0
+          cat init.mp4 "$s0" init2.mp4 "$b0" > ref_live_map.mp4
+          cmp out_live_map.mp4 ref_live_map.mp4
+          cmp out_live_trim.mp4 init2.mp4
+      - name: fixture - TS with a mid-stream EXT-X-DISCONTINUITY
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=128x72 -c:v mpeg2video -f mpegts d0.ts
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=128x72 -c:v mpeg2video -f mpegts d1.ts
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=64x48  -c:v mpeg2video -f mpegts d2.ts
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nd0.ts\n#EXTINF:1.0,\nd1.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nd2.ts\n#EXT-X-ENDLIST\n' > disc.m3u8
+          timeout 60 ../build/hlsdl -f -o out_disc.ts disc.m3u8
+          ffprobe -v error -show_entries format=format_name -of csv=p=0 out_disc.ts | grep -q .
+      - name: fixture - TS segments disguised as images (VOD + live)
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=3:s=64x48 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'img%d.ts' img.m3u8
+          # every segment gets an image in front of the TS data (a WEBP or a
+          # PNG head, alternating) and an image-like name, as on image CDNs
+          for f in $(grep '\.ts$' img.m3u8); do
+            n=${f#img}; n=${n%.ts}
+            if [ $((n % 2)) -eq 0 ]; then
+              printf 'RIFF\042\000\000\000WEBPVP8L\025\000\000\000\057\000\000\000\020\007\020\021\021\210\210\376\007\000' > "dis$n.image"
+            else
+              printf '\211PNG\r\n\032\n\000\000\000\015IHDR\000\000\000\001\000\000\000\001\010\006\000\000\000\037\025\304\211' > "dis$n.image"
+            fi
+            cat "$f" >> "dis$n.image"
+          done
+          sed 's/^img\([0-9]*\)\.ts$/dis\1.image/' img.m3u8 > dis.m3u8
+          cat dis.m3u8
+          # VOD: the image heads are cut off -> the same bytes as the plain TS
+          timeout 60 ../build/hlsdl -f -o ref_img.ts img.m3u8
+          timeout 60 ../build/hlsdl -f -o out_dis.ts dis.m3u8 2>dis.log
+          cat dis.log
+          grep -q 'disguised as images' dis.log
+          cmp out_dis.ts ref_img.ts
+          # live: the same cut in the live writer
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' dis.m3u8 > live_dis.m3u8
+          python3 -m http.server 8198 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8198/live_dis.m3u8 && break
+            sleep 0.5
+          done
+          # VOD over HTTP: curl.c used to cut 16 bytes off every PNG-headed
+          # segment (and read 16 bytes past the buffer), which left the rest of
+          # the PNG head in front of the TS data
+          timeout 60 ../build/hlsdl -f -o out_dis_http.ts "http://127.0.0.1:8198/dis.m3u8"
+          cmp out_dis_http.ts ref_img.ts
+          # -s 30: start at the first segment (the window is ~3 s), -i 2 ends
+          # cleanly after 2 s of media instead of waiting for new segments
+          timeout 30 ../build/hlsdl -f -s 30 -i 2 -e 1 -o out_live_dis.ts "http://127.0.0.1:8198/live_dis.m3u8" || true
+          kill $srv 2>/dev/null || true
+          ls -l out_live_dis.ts
+          test "$(head -c 1 out_live_dis.ts | od -An -tx1 | tr -d ' \n')" = 47
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_live_dis.ts | grep -q video
+      - name: fixture - TS video + separate audio playlist (A/V merge)
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # video-only and audio-only TS playlists; hlsdl -a muxes them into
+          # one TS via find_first_ts_packet + merge_packets
+          ffmpeg -v error -f lavfi -i testsrc=d=3:s=128x72 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'v%d.ts' vplaylist.m3u8
+          ffmpeg -v error -f lavfi -i sine=f=440:d=3 -c:a mp2 \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'a%d.ts' aplaylist.m3u8
+          timeout 60 ../build/hlsdl -f -a aplaylist.m3u8 -o out_av.ts vplaylist.m3u8
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_av.ts | sort -u > av.txt
+          cat av.txt
+          grep -q video av.txt
+          grep -q audio av.txt
+      - name: fixture - TS video + packed audio (ID3 + raw AAC) playlist
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # Packed audio: raw ADTS frames behind an ID3 tag whose PRIV frame
+          # carries the 90 kHz start timestamp. find_first_ts_packet() finds no
+          # TS packets in it, so the audio used to be dropped without a word.
+          ffmpeg -v error -f lavfi -i sine=f=440:d=3 -c:a aac -ar 44100 -f adts packed_src.aac
+          nseg=$(grep -c '\.ts$' vplaylist.m3u8)
+          python3 - "$nseg" <<'EOF'
+          import struct, sys
+          n = int(sys.argv[1])
+          data = open('packed_src.aac', 'rb').read()
+          frames, i = [], 0
+          while i + 7 <= len(data):
+              assert data[i] == 0xFF and (data[i + 1] & 0xF0) == 0xF0
+              flen = ((data[i + 3] & 3) << 11) | (data[i + 4] << 3) | (data[i + 5] >> 5)
+              frames.append(data[i:i + flen])
+              i += flen
+          per = -(-len(frames) // n)
+          owner = b'com.apple.streaming.transportStreamTimestamp\x00'
+          lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:1', '#EXT-X-MEDIA-SEQUENCE:0']
+          for s in range(n):
+              chunk = frames[s * per:(s + 1) * per]
+              ts = 126000 + s * per * 1024 * 90000 // 44100
+              body = owner + struct.pack('>Q', ts)
+              frame = b'PRIV' + struct.pack('>I', len(body)) + b'\x00\x00' + body
+              tag = b'ID3\x04\x00\x00' + bytes([0, 0, 0, len(frame)]) + frame
+              open('p%d.aac' % s, 'wb').write(tag + b''.join(chunk))
+              lines += ['#EXTINF:1.0,', 'p%d.aac' % s]
+          lines.append('#EXT-X-ENDLIST')
+          open('packed.m3u8', 'w').write('\n'.join(lines) + '\n')
+          EOF
+          cat packed.m3u8
+          timeout 60 ../build/hlsdl -f -a packed.m3u8 -o out_packed.ts vplaylist.m3u8
+          ffprobe -v error -show_entries stream=codec_type,codec_name -of csv=p=0 out_packed.ts | sort -u > packed.txt
+          cat packed.txt
+          grep -q video packed.txt
+          grep -q 'aac,audio' packed.txt
+          # the audio frames have to be readable, not only announced in the PMT
+          apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 out_packed.ts | head -1)
+          test "$apk" -gt 50
+      - name: fixture - live TS video + separate audio playlist
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # download_live_hls() used to take the video playlist only - a live
+          # stream with a separate audio rendition came out without sound
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' vplaylist.m3u8 > vlive.m3u8
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' aplaylist.m3u8 > alive.m3u8
+          python3 -m http.server 8202 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8202/vlive.m3u8 && break
+            sleep 0.5
+          done
+          timeout 60 ../build/hlsdl -f -s 30 -e 1 -a "http://127.0.0.1:8202/alive.m3u8" \
+                 -o out_live_av.ts "http://127.0.0.1:8202/vlive.m3u8" 2>live_av.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 1' live_av.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXT-X-ENDLIST\n' >> vlive.m3u8
+          printf '#EXT-X-ENDLIST\n' >> alive.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat live_av.log
+          test "$rc" -eq 0
+          grep -q '"d_t":"live"' live_av.log
+          ! grep -q 'No audio for segment' live_av.log
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_live_av.ts | sort -u > live_av.txt
+          cat live_av.txt
+          grep -q video live_av.txt
+          grep -q audio live_av.txt
+          apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 out_live_av.ts | head -1)
+          test "$apk" -gt 20
+      - name: fixture - live audio window one segment ahead of the video
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # The audio playlist is fetched after the video one; when the live
+          # window has moved on by a segment in between, the numbering is
+          # still the same: video 0..1, audio 1..2 here. Pairing must stay
+          # N <-> N: segment 0 has no audio (it already left the audio
+          # window), 1 has. Lining up the live edges instead (N <-> N+1) put
+          # every segment one segment out of sync, without any warning.
+          python3 - <<'EOF'
+          def entries(name):
+              head, segs, lines, i = [], [], open(name).read().split('\n'), 0
+              while i < len(lines):
+                  l = lines[i]
+                  if l.startswith('#EXTINF'):
+                      segs.append((l, lines[i + 1]))
+                      i += 2
+                      continue
+                  if l and not l.startswith(('#EXT-X-ENDLIST', '#EXT-X-MEDIA-SEQUENCE', '#EXT-X-PLAYLIST-TYPE')):
+                      head.append(l)
+                  i += 1
+              return head, segs
+          def write(name, head, seq, segs):
+              body = head + ['#EXT-X-MEDIA-SEQUENCE:%d' % seq] + [x for s in segs for x in s]
+              open(name, 'w').write('\n'.join(body) + '\n')
+          vh, vs = entries('vplaylist.m3u8')
+          ah, as_ = entries('aplaylist.m3u8')
+          assert len(vs) >= 3 and len(as_) >= 3
+          write('vlive_behind.m3u8', vh, 0, vs[0:2])
+          write('alive_ahead.m3u8', ah, 1, as_[1:3])
+          EOF
+          cat vlive_behind.m3u8 alive_ahead.m3u8
+          python3 -m http.server 8203 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8203/vlive_behind.m3u8 && break
+            sleep 0.5
+          done
+          timeout 60 ../build/hlsdl -v -f -s 30 -e 1 -a "http://127.0.0.1:8203/alive_ahead.m3u8" \
+                 -o out_ahead.ts "http://127.0.0.1:8203/vlive_behind.m3u8" 2>ahead.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 1' ahead.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXT-X-ENDLIST\n' >> vlive_behind.m3u8
+          printf '#EXT-X-ENDLIST\n' >> alive_ahead.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat ahead.log
+          test "$rc" -eq 0
+          ! grep -q 'numbered apart' ahead.log
+          grep -q 'No audio for segment 0 ' ahead.log
+          ! grep -q 'No audio for segment 1 ' ahead.log
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_ahead.ts | sort -u | grep -q audio
+      - name: fixture - live audio that cannot be fetched is given up, the video goes on
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # every audio segment answers 404: after 3 misses the audio track
+          # (and its refresh thread, mid-download) is stopped, the video is
+          # written alone and hlsdl still ends normally at the ENDLIST
+          sed 's/^a\([0-9]*\)\.ts$/gone\1.ts/' alive.m3u8 | sed '/#EXT-X-ENDLIST/d' > alive_gone.m3u8
+          sed '/#EXT-X-ENDLIST/d' vlive.m3u8 > vlive_gone.m3u8
+          cat alive_gone.m3u8
+          python3 -m http.server 8204 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8204/vlive_gone.m3u8 && break
+            sleep 0.5
+          done
+          timeout 90 ../build/hlsdl -f -s 30 -e 1 -a "http://127.0.0.1:8204/alive_gone.m3u8" \
+                 -o out_gone.ts "http://127.0.0.1:8204/vlive_gone.m3u8" 2>gone.log &
+          dl=$!
+          for _ in $(seq 120); do
+            grep -q 'keeps failing' gone.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXT-X-ENDLIST\n' >> vlive_gone.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat gone.log
+          test "$rc" -eq 0
+          grep -q 'keeps failing' gone.log
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_gone.ts | sort -u > gone.txt
+          cat gone.txt
+          grep -q video gone.txt
+          ! grep -q audio gone.txt
+      - name: fixture - TS audio with an ID3 tag in front, PIDs changing at a discontinuity
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # audio packets over all audio streams (a PID change makes a second
+          # one); ffprobe lists a stream once per program too, hence sort -u
+          pk() { ffprobe -v error -select_streams a -count_packets -show_entries stream=index,nb_read_packets -of csv=p=0 "$1" | sort -u | awk -F, '{s += $2} END {print s + 0}'; }
+          # An ID3 timed-metadata tag in front of TS audio is no packed audio:
+          # it must still be merged as TS
+          python3 - <<'EOF'
+          import struct
+          body = b'com.example.meta\x00' + b'x' * 8
+          frame = b'PRIV' + struct.pack('>I', len(body)) + b'\x00\x00' + body
+          tag = b'ID3\x04\x00\x00' + bytes([0, 0, 0, len(frame)]) + frame
+          src = open('aplaylist.m3u8').read()
+          for l in src.split('\n'):
+              if l.endswith('.ts'):
+                  open('id3' + l, 'wb').write(tag + open(l, 'rb').read())
+          open('id3a.m3u8', 'w').write('\n'.join(('id3' + l) if l.endswith('.ts') else l for l in src.split('\n')))
+          EOF
+          timeout 60 ../build/hlsdl -f -a id3a.m3u8 -o out_id3ts.ts vplaylist.m3u8 2>id3ts.log
+          cat id3ts.log
+          ! grep -q 'Could not merge' id3ts.log
+          test "$(pk out_id3ts.ts)" -eq "$(pk out_av.ts)"
+          # After a discontinuity the TS PIDs / PMT change (ad break): the
+          # merge has to work its PMT out again, or the audio after it is lost
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=128x72 -c:v mpeg2video \
+                 -mpegts_pmt_start_pid 0x1100 -mpegts_start_pid 0x130 -f mpegts vx.ts
+          ffmpeg -v error -f lavfi -i sine=f=880:d=1 -c:a mp2 \
+                 -mpegts_pmt_start_pid 0x1200 -mpegts_start_pid 0x140 -f mpegts ax.ts
+          hdr='#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n'
+          { printf "$hdr"; printf '#EXTINF:1.0,\nv0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nvx.ts\n#EXT-X-ENDLIST\n'; } > vdisc.m3u8
+          { printf "$hdr"; printf '#EXTINF:1.0,\na0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nax.ts\n#EXT-X-ENDLIST\n'; } > adisc.m3u8
+          { printf "$hdr"; printf '#EXTINF:1.0,\nv0.ts\n#EXT-X-ENDLIST\n'; } > vone.m3u8
+          { printf "$hdr"; printf '#EXTINF:1.0,\na0.ts\n#EXT-X-ENDLIST\n'; } > aone.m3u8
+          timeout 60 ../build/hlsdl -f -a aone.m3u8 -o out_one.ts vone.m3u8
+          timeout 60 ../build/hlsdl -f -a adisc.m3u8 -o out_adisc.ts vdisc.m3u8
+          one=$(pk out_one.ts); both=$(pk out_adisc.ts); ax=$(pk ax.ts)
+          echo "one=$one both=$both ax=$ax"
+          # the audio of the second part is in the file, not just the first
+          test "$both" -ge $((one + ax * 3 / 4))
+          # Many discontinuities, and the audio PMT layout changes with them
+          # (a language descriptor makes its ES_info longer): every re-parse
+          # has to start from a clean PMT - stale components used to pile up
+          # until hlsdl exited ("Components table to small") or wrote past
+          # its buffer.
+          ffmpeg -v error -f lavfi -i sine=f=660:d=1 -c:a mp2 -metadata:s:a:0 language=deu \
+                 -mpegts_pmt_start_pid 0x1300 -mpegts_start_pid 0x150 -f mpegts al.ts
+          {
+            printf "$hdr"
+            for i in 1 2 3; do
+              printf '#EXTINF:1.0,\nv0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nvx.ts\n#EXT-X-DISCONTINUITY\n'
+            done
+            printf '#EXTINF:1.0,\nv0.ts\n#EXT-X-ENDLIST\n'
+          } > vmany.m3u8
+          {
+            printf "$hdr"
+            for i in 1 2 3; do
+              printf '#EXTINF:1.0,\na0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nal.ts\n#EXT-X-DISCONTINUITY\n'
+            done
+            printf '#EXTINF:1.0,\na0.ts\n#EXT-X-ENDLIST\n'
+          } > amany.m3u8
+          timeout 60 ../build/hlsdl -f -a amany.m3u8 -o out_many.ts vmany.m3u8 2>many.log
+          ! grep -q 'Could not merge' many.log
+          many=$(pk out_many.ts); al=$(pk al.ts)
+          echo "many=$many one=$one al=$al"
+          test "$many" -ge $(( (4 * one + 3 * al) * 3 / 4 ))
+      - name: fixture - AES-128 with EXT-X-MAP before EXT-X-KEY
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=2:s=64x48 -c:v libx264 -g 15 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename ki.mp4 ki.m3u8
+          head -c 16 /dev/urandom > enc.key
+          KEYHEX=$(xxd -p -c 32 enc.key)
+          IV=000102030405060708090a0b0c0d0e0f
+          seg=$(grep -v '^#' ki.m3u8 | head -1)
+          openssl aes-128-cbc -e -K "$KEYHEX" -iv "$IV" -in ki.mp4 -out ki.mp4.enc
+          openssl aes-128-cbc -e -K "$KEYHEX" -iv "$IV" -in "$seg"  -out seg0.enc
+          {
+            printf '#EXTM3U\n#EXT-X-VERSION:5\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n'
+            printf '#EXT-X-MAP:URI="ki.mp4.enc"\n'
+            printf '#EXT-X-KEY:METHOD=AES-128,URI="enc.key",IV=0x%s\n' "$IV"
+            printf '#EXTINF:2.0,\nseg0.enc\n#EXT-X-ENDLIST\n'
+          } > mapkey.m3u8
+          cat mapkey.m3u8
+          timeout 30 ../build/hlsdl -f -o out_mapkey.mp4 mapkey.m3u8
+          # the init segment must come out decrypted (ftyp box), not ciphertext
+          dd if=out_mapkey.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+      - name: fixture - AES-128 IV in upper case, IV before URI
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # RFC 8216 writes the IV hex digits in upper case and the attributes may
+          # come in any order; a wrong IV only breaks the first 16 bytes of each
+          # segment, i.e. exactly the ftyp box checked below
+          IVU=A1B2C3D4E5F60718293A4B5C6D7E8F90
+          openssl aes-128-cbc -e -K "$(xxd -p -c 32 enc.key)" -iv "$IVU" -in ki.mp4 -out ki_u.mp4.enc
+          {
+            printf '#EXTM3U\n#EXT-X-VERSION:5\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n'
+            printf '#EXT-X-MAP:URI="ki_u.mp4.enc"\n'
+            printf '#EXT-X-KEY:METHOD=AES-128,IV=0X%s,URI="enc.key",KEYFORMAT="identity"\n' "$IVU"
+            printf '#EXTINF:2.0,\nseg0_u.enc\n#EXT-X-ENDLIST\n'
+          } > mapkey_u.m3u8
+          seg=$(grep -v '^#' ki.m3u8 | head -1)
+          openssl aes-128-cbc -e -K "$(xxd -p -c 32 enc.key)" -iv "$IVU" -in "$seg" -out seg0_u.enc
+          cat mapkey_u.m3u8
+          timeout 30 ../build/hlsdl -f -o out_mapkey_u.mp4 mapkey_u.m3u8
+          dd if=out_mapkey_u.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+      - name: fixture - key rotation, METHOD=NONE and a key without IV
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=6:s=64x48 -c:v mpeg2video -g 25 \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'rk%d.ts' rk_src.m3u8
+          test "$(grep -c '\.ts$' rk_src.m3u8)" -ge 4
+          head -c 16 /dev/urandom > k1.key
+          head -c 16 /dev/urandom > k2.key
+          IV2=0F0E0D0C0B0A09080706050403020100
+          # segment 1 under k1 with the implicit IV (its media sequence number),
+          # segment 3 under k2 with an explicit IV; 0 and 2 are in the clear
+          openssl aes-128-cbc -e -K "$(xxd -p -c 32 k1.key)" -iv 00000000000000000000000000000001 -in rk1.ts -out rk1.enc
+          openssl aes-128-cbc -e -K "$(xxd -p -c 32 k2.key)" -iv "$IV2" -in rk3.ts -out rk3.enc
+          hdr='#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n'
+          {
+            printf "$hdr"
+            printf '#EXTINF:1.0,\nrk0.ts\n#EXTINF:1.0,\nrk1.ts\n#EXTINF:1.0,\nrk2.ts\n#EXTINF:1.0,\nrk3.ts\n#EXT-X-ENDLIST\n'
+          } > rk_plain.m3u8
+          # the last method used to apply to every segment (rk0 got "decrypted"),
+          # and the IV search ran on into the next EXT-X-KEY line (k1 took IV2)
+          {
+            printf "$hdr"
+            printf '#EXTINF:1.0,\nrk0.ts\n'
+            printf '#EXT-X-KEY:METHOD=AES-128,URI="k1.key"\n#EXTINF:1.0,\nrk1.enc\n'
+            printf '#EXT-X-KEY:METHOD=NONE\n#EXTINF:1.0,\nrk2.ts\n'
+            printf '#EXT-X-KEY:METHOD=AES-128,URI="k2.key",IV=0x%s\n#EXTINF:1.0,\nrk3.enc\n' "$IV2"
+            printf '#EXT-X-ENDLIST\n'
+          } > rk.m3u8
+          cat rk.m3u8
+          timeout 60 ../build/hlsdl -f -o ref_rk.ts rk_plain.m3u8
+          timeout 60 ../build/hlsdl -f -o out_rk.ts rk.m3u8
+          cmp out_rk.ts ref_rk.ts
+      - name: fixture - master playlist with CRLF, a variant without RESOLUTION, no final newline
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # CRLF used to leave a \r in the variant URL. The variant list is
+          # built in reverse, so -W looks at the one without RESOLUTION first -
+          # that used to end the search with "No resolution match found".
+          printf '#EXTM3U\r\n#EXT-X-STREAM-INF:BANDWIDTH=200000,RESOLUTION=64x48\r\nrk_plain.m3u8\r\n#EXT-X-STREAM-INF:BANDWIDTH=100000\r\nrk_plain.m3u8\r\n' > crlf_master.m3u8
+          timeout 60 ../build/hlsdl -f -W 100 -o out_crlf.ts crlf_master.m3u8
+          cmp out_crlf.ts ref_rk.ts
+          # a variant URL on the last line without a newline used to be dropped
+          printf '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000\nrk_plain.m3u8' > nonl_master.m3u8
+          timeout 60 ../build/hlsdl -f -b -o out_nonl.ts nonl_master.m3u8
+          cmp out_nonl.ts ref_rk.ts
+      - name: fixture - live playlist that ends without new segments
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nrk0.ts\n#EXTINF:1.0,\nrk1.ts\n' > live_end.m3u8
+          { cat live_end.m3u8; printf '#EXT-X-ENDLIST\n'; } > live_end_vod.m3u8
+          timeout 60 ../build/hlsdl -f -o ref_end.ts live_end_vod.m3u8
+          python3 -m http.server 8199 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8199/live_end.m3u8 && break
+            sleep 0.5
+          done
+          timeout 30 ../build/hlsdl -f -s 30 -e 1 -o out_end.ts "http://127.0.0.1:8199/live_end.m3u8" 2>live_end.log &
+          dl=$!
+          # change the playlist only once hlsdl is through the first window
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 1' live_end.log && break
+            sleep 0.5
+          done
+          sleep 1
+          # the stream ends with no new segment: hlsdl used to wait forever on
+          # the empty queue (here: until the timeout kills it, exit 124)
+          printf '#EXT-X-ENDLIST\n' >> live_end.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          test "$rc" -eq 0
+          cmp out_end.ts ref_end.ts
+      - name: fixture - an unusable key and a full disk fail the download
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # a key of the wrong length used to leave an all-zero key -> garbage, exit 0
+          head -c 15 /dev/urandom > short.key
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-KEY:METHOD=AES-128,URI="short.key"\n#EXTINF:1.0,\nrk1.enc\n#EXT-X-ENDLIST\n' > badkey.m3u8
+          if timeout 30 ../build/hlsdl -f -o out_badkey.ts badkey.m3u8; then
+            echo "hlsdl reported success without a usable key" >&2; exit 1
+          fi
+          # output that could not be written used to end with exit code 0
+          if timeout 30 ../build/hlsdl -o - rk_plain.m3u8 > /dev/full; then
+            echo "hlsdl reported success although nothing could be written" >&2; exit 1
+          fi
+      - name: fixture - unreachable segment fails the download
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\ndoes-not-exist.ts\n#EXT-X-ENDLIST\n' > broken.m3u8
+          # a segment that cannot be fetched must give a non-zero exit
+          if timeout 30 ../build/hlsdl -f -o out_broken.ts broken.m3u8; then
+            echo "hlsdl reported success for an unreachable segment" >&2
+            exit 1
+          fi
+          # -q (as e2iplayer runs it) still tells why; -qq is silent
+          timeout 30 ../build/hlsdl -q -w 0 -f -o out_broken.ts broken.m3u8 2>q.log || true
+          cat q.log
+          grep -q '^Error: ' q.log
+          grep -q '"error_code"' q.log
+          ! grep -q 'Downloading part' q.log
+          timeout 30 ../build/hlsdl -q -q -w 0 -f -o out_broken.ts broken.m3u8 2>qq.log || true
+          test ! -s qq.log
+      - name: fixture - -I skips a segment that cannot be fetched
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          hdr='#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n'
+          { printf "$hdr"; printf '#EXTINF:1.0,\nrk0.ts\n#EXTINF:1.0,\nmissing.ts\n#EXTINF:1.0,\nrk2.ts\n#EXT-X-ENDLIST\n'; } > gap.m3u8
+          { printf "$hdr"; printf '#EXTINF:1.0,\nrk0.ts\n#EXTINF:1.0,\nrk2.ts\n#EXT-X-ENDLIST\n'; } > gap_ref.m3u8
+          timeout 60 ../build/hlsdl -f -o ref_gap.ts gap_ref.m3u8
+          # without -I the gap fails the download, with -I it is left out
+          if timeout 60 ../build/hlsdl -f -w 0 -o out_gap.ts gap.m3u8; then
+            echo "expected the download with a missing segment to fail" >&2; exit 1
+          fi
+          timeout 60 ../build/hlsdl -f -w 0 -I -o out_gap.ts gap.m3u8 2>gap.log
+          cat gap.log
+          grep -q '1 of 3 segments were skipped' gap.log
+          cmp out_gap.ts ref_gap.ts
+          # nothing fetched at all is still a failure
+          { printf "$hdr"; printf '#EXTINF:1.0,\nmissing.ts\n#EXT-X-ENDLIST\n'; } > allgap.m3u8
+          if timeout 60 ../build/hlsdl -f -w 0 -I -o out_allgap.ts allgap.m3u8; then
+            echo "-I reported success although no segment was downloaded" >&2; exit 1
+          fi
+          # -R cannot tell a skipped gap from the finished part
+          if timeout 30 ../build/hlsdl -f -R -I -o out_ri.ts gap_ref.m3u8 2>ri.log; then
+            echo "-R together with -I was accepted" >&2; exit 1
+          fi
+          grep -q 'cannot be combined' ri.log
+      - name: fixture - EXT-X-KEY / EXT-X-MAP attributes in any order, unusable responses
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          hdr='#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n'
+          # METHOD not first, and an empty attribute value in front of URI
+          {
+            printf "$hdr"
+            printf '#EXTINF:1.0,\nrk0.ts\n'
+            printf '#EXT-X-KEY:KEYFORMATVERSIONS="",URI="k1.key",METHOD=AES-128\n#EXTINF:1.0,\nrk1.enc\n'
+            printf '#EXT-X-KEY:METHOD=NONE\n#EXTINF:1.0,\nrk2.ts\n'
+            printf '#EXT-X-KEY:IV=0x0F0E0D0C0B0A09080706050403020100,URI="k2.key",METHOD=AES-128\n#EXTINF:1.0,\nrk3.enc\n'
+            printf '#EXT-X-ENDLIST\n'
+          } > rk_order.m3u8
+          timeout 60 ../build/hlsdl -f -o out_rk_order.ts rk_order.m3u8
+          cmp out_rk_order.ts ref_rk.ts
+          # BYTERANGE before URI on EXT-X-MAP
+          sed 's/^#EXT-X-MAP:URI="blob.mp4",BYTERANGE="\([0-9@]*\)"$/#EXT-X-MAP:BYTERANGE="\1",URI="blob.mp4"/' sf.m3u8 > sf_order.m3u8
+          grep -q '^#EXT-X-MAP:BYTERANGE=' sf_order.m3u8
+          timeout 60 ../build/hlsdl -f -o out_sf_order.mp4 sf_order.m3u8
+          cmp out_sf_order.mp4 blob.mp4
+          # an empty segment body is a failed transfer (local files cannot show
+          # this - an empty local file is already a 404)
+          : > empty.ts
+          { printf "$hdr"; printf '#EXTINF:1.0,\nrk0.ts\n#EXTINF:1.0,\nempty.ts\n#EXTINF:1.0,\nrk2.ts\n#EXT-X-ENDLIST\n'; } > empty.m3u8
+          python3 -m http.server 8200 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8200/empty.m3u8 && break
+            sleep 0.5
+          done
+          rc_empty=0
+          timeout 60 ../build/hlsdl -f -w 0 -o out_empty.ts "http://127.0.0.1:8200/empty.m3u8" || rc_empty=$?
+          timeout 60 ../build/hlsdl -f -w 0 -I -o out_empty_i.ts "http://127.0.0.1:8200/empty.m3u8"
+          # init segment over HTTP: without Range support the server answers
+          # 200 with the whole file, which must not be written as the init segment
+          range_code=$(curl -s -o /dev/null -w '%{http_code}' -r 0-1 http://127.0.0.1:8200/blob.mp4)
+          rc_sf=0
+          timeout 60 ../build/hlsdl -f -w 0 -o out_sf_http.mp4 "http://127.0.0.1:8200/sf.m3u8" 2>sf_http.log || rc_sf=$?
+          kill $srv 2>/dev/null || true
+          test "$rc_empty" -ne 0
+          cmp out_empty_i.ts ref_gap.ts
+          cat sf_http.log
+          if [ "$range_code" = 206 ]; then
+            test "$rc_sf" -eq 0
+            cmp out_sf_http.mp4 blob.mp4
+          else
+            test "$rc_sf" -ne 0
+            grep -q 'does not match its byte range' sf_http.log
+          fi
+      - name: fixture - interrupted VOD download resumes to the same bytes
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=5:s=64x48 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'rs%d.ts' rs_full.m3u8
+          n=$(grep -c '\.ts$' rs_full.m3u8)
+          test "$n" -ge 4
+          # reference: a clean full download
+          timeout 60 ../build/hlsdl -f -o ref.ts rs_full.m3u8
+          # interrupt without touching the playlist: make the 3rd segment
+          # briefly unreadable (a real interruption is a transfer failure, not
+          # a playlist edit - and a playlist edit is what the fingerprint is
+          # meant to catch)
+          seg3=$(grep '\.ts$' rs_full.m3u8 | sed -n 3p)
+          chmod 000 "$seg3"
+          if timeout 60 ../build/hlsdl -f -R -w 1 -o out.ts rs_full.m3u8; then
+            echo "expected the interrupted run to fail" >&2; exit 1
+          fi
+          test -s out.ts.hlsdl.resume
+          grep -q '^hlsdl-resume 2$' out.ts.hlsdl.resume
+          grep -q '^done 2$' out.ts.hlsdl.resume
+          cp out.ts.hlsdl.resume saved.resume
+          # clear the fault and resume against the same playlist
+          chmod 644 "$seg3"
+          timeout 60 ../build/hlsdl -R -o out.ts rs_full.m3u8 2>resume.log
+          # cmp alone cannot tell a resume from a fresh restart - check it really resumed
+          grep -q '^Resuming: 2/' resume.log || { echo "::error::TS run did not resume: $(tail -n 5 resume.log | tr '\n' '|')"; exit 1; }
+          test ! -e out.ts.hlsdl.resume
+          cmp ref.ts out.ts
+          # "already complete" no-op: the real sidecar bumped to done == total
+          cp ref.ts out2.ts
+          sed "s/^done .*/done $n/;s/^bytes .*/bytes $(stat -c%s ref.ts)/" saved.resume > out2.ts.hlsdl.resume
+          timeout 30 ../build/hlsdl -R -o out2.ts rs_full.m3u8 2>noop.txt
+          test ! -e out2.ts.hlsdl.resume
+          cmp ref.ts out2.ts
+          # ... and reports the finished size, so a status-only frontend does not see 0
+          grep -q "\"d_s\":$(stat -c%s ref.ts)" noop.txt
+          # a sidecar from a different playlist (same segment count) is refused
+          ffmpeg -v error -f lavfi -i testsrc=d=5:s=48x32 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'other%d.ts' other.m3u8
+          test "$(grep -c '\.ts$' other.m3u8)" -eq "$n"
+          timeout 60 ../build/hlsdl -f -o other_ref.ts other.m3u8
+          cp saved.resume other_out.ts.hlsdl.resume
+          timeout 60 ../build/hlsdl -f -R -o other_out.ts other.m3u8 2>warn.txt
+          grep -qi 'does not match' warn.txt
+          test ! -e other_out.ts.hlsdl.resume
+          cmp other_ref.ts other_out.ts
+      - name: fixture - resume survives per-request query tokens in the segment URLs
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # every failed check leaves its context in an ::error:: annotation
+          fail() { echo "::error::token fixture: $1 :: sidecar=[$(tr '\n' ' ' < tok_out.ts.hlsdl.resume 2>&1)] :: log1=[$(tail -n 5 tok1.log 2>&1 | tr '\n' '|')] :: log2=[$(tail -n 5 tok2.log 2>&1 | tr '\n' '|')]"; exit 1; }
+          (python3 -m http.server 8197 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 2
+          # one playlist URL whose content changes between the runs: only the signed
+          # query token on every segment differs (the stored segment URL embeds the
+          # playlist's own path, so the playlist file name has to stay the same)
+          sed 's#\(rs[0-9]*\.ts\)$#\1?token=AAAA#' rs_full.m3u8 > tok.m3u8
+          grep -q 'rs0.ts?token=AAAA' tok.m3u8 || fail "sed did not add the tokens"
+          curl -sf http://127.0.0.1:8197/tok.m3u8 > /dev/null || fail "test server not reachable"
+          seg3=$(grep '\.ts$' rs_full.m3u8 | sed -n 3p)
+          # break the 3rd segment (the server answers 404 for an unreadable file)
+          chmod 000 "$seg3"
+          rc=0
+          timeout 60 ../build/hlsdl -f -R -w 1 -o tok_out.ts http://127.0.0.1:8197/tok.m3u8 2>tok1.log || rc=$?
+          [ "$rc" -ne 0 ] || fail "the interrupted run did not fail"
+          grep -q '^done 2$' tok_out.ts.hlsdl.resume || fail "no sidecar with done 2 after the interrupted run (rc=$rc)"
+          chmod 644 "$seg3"
+          # second run with different tokens must still resume, not start over
+          sed 's#\(rs[0-9]*\.ts\)$#\1?token=BBBB#' rs_full.m3u8 > tok.m3u8
+          rc=0
+          timeout 60 ../build/hlsdl -R -o tok_out.ts http://127.0.0.1:8197/tok.m3u8 2>tok2.log || rc=$?
+          [ "$rc" -eq 0 ] || fail "the second run failed (rc=$rc)"
+          grep -q '^Resuming: 2/' tok2.log || fail "the second run did not resume"
+          test ! -e tok_out.ts.hlsdl.resume || fail "sidecar left behind"
+          cmp ref.ts tok_out.ts || fail "output differs from the reference"
+          pkill -f 'http.server 8197' || true
+      - name: fixture - resume is refused when the playlist really changed
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          fail() { echo "::error::changed-playlist fixture: $1 :: log=[$(tail -n 5 chg.log 2>&1 | tr '\n' '|')]"; exit 1; }
+          seg3=$(grep '\.ts$' rs_full.m3u8 | sed -n 3p)
+          # (1) same segment URLs, one segment duration different
+          chmod 000 "$seg3"
+          rc=0
+          timeout 60 ../build/hlsdl -f -R -w 1 -o dur_out.ts rs_full.m3u8 2>chg.log || rc=$?
+          [ "$rc" -ne 0 ] || fail "the interrupted run did not fail"
+          grep -q '^done 2$' dur_out.ts.hlsdl.resume || fail "no sidecar with done 2"
+          chmod 644 "$seg3"
+          sed '0,/^#EXTINF:[0-9.]*,/s//#EXTINF:7.000000,/' rs_full.m3u8 > rs_dur.m3u8
+          ! cmp -s rs_full.m3u8 rs_dur.m3u8 || fail "sed did not change a duration"
+          timeout 60 ../build/hlsdl -f -R -o dur_out.ts rs_dur.m3u8 2>chg.log
+          grep -qi 'does not match' chg.log || fail "a changed duration did not refuse the resume"
+          cmp ref.ts dur_out.ts
+          # (2) same segment URLs, a different variant (bandwidth / resolution) picked
+          #     by -b; the master keeps its URL, only its content changes
+          (python3 -m http.server 8197 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 2
+          printf '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=64x48\nrs_full.m3u8\n' > master.m3u8
+          curl -sf http://127.0.0.1:8197/master.m3u8 > /dev/null || fail "test server not reachable"
+          chmod 000 "$seg3"
+          rc=0
+          timeout 60 ../build/hlsdl -f -R -b -w 1 -o var_out.ts http://127.0.0.1:8197/master.m3u8 2>chg.log || rc=$?
+          [ "$rc" -ne 0 ] || fail "the interrupted variant run did not fail"
+          grep -q '^done 2$' var_out.ts.hlsdl.resume || fail "no variant sidecar with done 2"
+          chmod 644 "$seg3"
+          printf '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=128x96\nrs_full.m3u8\n' > master.m3u8
+          timeout 60 ../build/hlsdl -f -R -b -o var_out.ts http://127.0.0.1:8197/master.m3u8 2>chg.log
+          grep -qi 'does not match' chg.log || fail "a different variant did not refuse the resume"
+          cmp ref.ts var_out.ts
+          pkill -f 'http.server 8197' || true
+      - name: fixture - interrupted fMP4 (EXT-X-MAP) download resumes
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=5:s=64x48 -c:v mpeg4 \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename rfi.mp4 \
+                 -hls_segment_filename 'rf%d.m4s' rf_full.m3u8
+          m=$(grep -c '\.m4s$' rf_full.m3u8)
+          test "$m" -ge 4
+          timeout 60 ../build/hlsdl -f -o rf_ref.mp4 rf_full.m3u8
+          seg3=$(grep '\.m4s$' rf_full.m3u8 | sed -n 3p)
+          chmod 000 "$seg3"
+          if timeout 60 ../build/hlsdl -f -R -w 1 -o rf_out.mp4 rf_full.m3u8; then
+            echo "expected the interrupted fMP4 run to fail" >&2; exit 1
+          fi
+          grep -q '^map 1$' rf_out.mp4.hlsdl.resume
+          grep -q '^done 2$' rf_out.mp4.hlsdl.resume
+          chmod 644 "$seg3"
+          timeout 60 ../build/hlsdl -R -o rf_out.mp4 rf_full.m3u8 2>rf_resume.log
+          grep -q '^Resuming: 2/' rf_resume.log || { echo "::error::fMP4 run did not resume: $(tail -n 5 rf_resume.log | tr '\n' '|')"; exit 1; }
+          test ! -e rf_out.mp4.hlsdl.resume
+          cmp rf_ref.mp4 rf_out.mp4
+          # exactly one ftyp: the init segment was not re-written on resume
+          test "$(grep -a -o ftyp rf_out.mp4 | wc -l)" -eq 1
+      - name: fixture - interrupted resume on the -a A/V-merge path
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=4:s=128x72 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'mv%d.ts' mv.m3u8
+          ffmpeg -v error -f lavfi -i sine=f=440:d=4 -c:a mp2 \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'ma%d.ts' ma.m3u8
+          test "$(grep -c '\.ts$' mv.m3u8)" -ge 3
+          timeout 60 ../build/hlsdl -f -a ma.m3u8 -o mav_ref.ts mv.m3u8
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 mav_ref.ts | sort -u > mav.txt
+          grep -q video mav.txt
+          grep -q audio mav.txt
+          v3=$(grep '\.ts$' mv.m3u8 | sed -n 3p)
+          chmod 000 "$v3"
+          if timeout 60 ../build/hlsdl -f -R -w 1 -a ma.m3u8 -o mav_out.ts mv.m3u8; then
+            echo "expected the interrupted -a run to fail" >&2; exit 1
+          fi
+          test -s mav_out.ts.hlsdl.resume
+          chmod 644 "$v3"
+          timeout 60 ../build/hlsdl -R -a ma.m3u8 -o mav_out.ts mv.m3u8 2>mav_resume.log
+          grep -q '^Resuming: 2/' mav_resume.log || { echo "::error::-a run did not resume: $(tail -n 5 mav_resume.log | tr '\n' '|')"; exit 1; }
+          test ! -e mav_out.ts.hlsdl.resume
+          test -s mav_out.ts
+          # both streams are still there after the resume splice
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 mav_out.ts | sort -u > mav_out.txt
+          grep -q video mav_out.txt
+          grep -q audio mav_out.txt
+          # the resume appended the tail: the file runs most of the ~4 s
+          # reference, not just the 2 segments finished before the break
+          dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 mav_out.ts | cut -d. -f1)
+          test "${dur:-0}" -ge 3
+      # ---- v0.37: HLS 2nd edition (draft-pantos-hls-rfc8216bis) fixes ----
+      - name: fixture - fMP4 video + fMP4 audio rendition muxed into one file (master, -a)
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # both encodes start with track_ID 1 - the audio has to be renumbered
+          ffmpeg -v error -f lavfi -i testsrc=d=6:s=128x72:r=25 -c:v libx264 -g 25 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename fvinit.mp4 \
+                 -hls_segment_filename 'fv%d.m4s' fvid.m3u8
+          ffmpeg -v error -f lavfi -i sine=f=440:d=6 -c:a aac -ar 48000 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename fainit.mp4 \
+                 -hls_segment_filename 'fa%d.m4s' faud.m3u8
+          # URI first and no DEFAULT=YES: the rendition used to be ignored
+          # (hlsdl only knew "#EXT-X-MEDIA:TYPE=AUDIO,")
+          printf '#EXTM3U\n#EXT-X-MEDIA:URI="faud.m3u8",TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en"\n#EXT-X-STREAM-INF:BANDWIDTH=500000,CODECS="avc1.42c00d,mp4a.40.2",AUDIO="aud"\nfvid.m3u8\n' > fav_master.m3u8
+          timeout 60 ../build/hlsdl -b -f -o fav.mp4 fav_master.m3u8 < /dev/null 2>fav.log
+          cat fav.log
+          ! grep -q 'fmp4-alt-audio' fav.log
+          dd if=fav.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          test "$(grep -a -o ftyp fav.mp4 | wc -l)" -eq 1
+          ffprobe -v error -show_entries stream=index,codec_type,codec_name -of csv=p=0 fav.mp4 > fav.txt
+          cat fav.txt
+          grep -q 'h264,video' fav.txt
+          grep -q 'aac,audio' fav.txt
+          vpk=$(ffprobe -v error -select_streams v -count_packets -show_entries stream=nb_read_packets -of csv=p=0 fav.mp4 | head -1 | cut -d, -f1)
+          apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 fav.mp4 | head -1 | cut -d, -f1)
+          test "$vpk" -eq 150
+          test "$apk" -ge 280
+          # decodes cleanly, both tracks run the full 6 s
+          ffmpeg -v error -i fav.mp4 -f null - 2>fav_dec.log
+          test ! -s fav_dec.log
+          adur=$(ffprobe -v error -select_streams a -show_entries stream=duration -of csv=p=0 fav.mp4 | cut -d, -f1 | cut -d. -f1)
+          test "${adur:-0}" -ge 5
+          # the same through -a
+          timeout 60 ../build/hlsdl -f -a faud.m3u8 -o fav_a.mp4 fvid.m3u8
+          cmp fav.mp4 fav_a.mp4
+      - name: fixture - fMP4 A/V mux, interrupted and resumed (-R)
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          seg2=$(grep '\.m4s$' fvid.m3u8 | sed -n 2p)
+          chmod 000 "$seg2"
+          if timeout 60 ../build/hlsdl -f -R -w 1 -a faud.m3u8 -o fav_r.mp4 fvid.m3u8; then
+            echo "expected the interrupted fMP4 A/V run to fail" >&2; exit 1
+          fi
+          grep -q '^done 1$' fav_r.mp4.hlsdl.resume
+          chmod 644 "$seg2"
+          timeout 60 ../build/hlsdl -R -a faud.m3u8 -o fav_r.mp4 fvid.m3u8 2>fav_r.log
+          grep -q '^Resuming: 1/' fav_r.log || { echo "::error::fMP4 A/V run did not resume: $(tail -n 5 fav_r.log | tr '\n' '|')"; exit 1; }
+          test ! -e fav_r.mp4.hlsdl.resume
+          cmp fav.mp4 fav_r.mp4
+      - name: fixture - live fMP4 video + fMP4 audio rendition
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' fvid.m3u8 > fvlive.m3u8
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' faud.m3u8 > falive.m3u8
+          python3 -m http.server 8206 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8206/fvlive.m3u8 && break
+            sleep 0.5
+          done
+          timeout 60 ../build/hlsdl -f -s 30 -e 1 -a "http://127.0.0.1:8206/falive.m3u8" \
+                 -o fav_live.mp4 "http://127.0.0.1:8206/fvlive.m3u8" 2>fav_live.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 1' fav_live.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXT-X-ENDLIST\n' >> fvlive.m3u8
+          printf '#EXT-X-ENDLIST\n' >> falive.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat fav_live.log
+          test "$rc" -eq 0
+          grep -q '"d_t":"live"' fav_live.log
+          ! grep -q 'No audio for segment' fav_live.log
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 fav_live.mp4 | sort -u > fav_live.txt
+          cat fav_live.txt
+          grep -q video fav_live.txt
+          grep -q audio fav_live.txt
+          apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 fav_live.mp4 | head -1 | cut -d, -f1)
+          test "$apk" -ge 280
+          ffmpeg -v error -i fav_live.mp4 -f null - 2>fav_live_dec.log
+          test ! -s fav_live_dec.log
+      - name: fixture - audio rendition choice without asking (DEFAULT, -A, muxed one)
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # no DEFAULT=YES and two renditions: hlsdl -b used to ask on stdin
+          # ("Which Language should be downloaded?") and hang or exit 1
+          printf '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Deutsch",LANGUAGE="de",URI="aplaylist.m3u8"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="English",LANGUAGE="en",URI="does-not-exist.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=300000,AUDIO="a"\nvplaylist.m3u8\n' > sel_master.m3u8
+          timeout 60 ../build/hlsdl -v -b -f -o out_sel.ts sel_master.m3u8 < /dev/null 2>sel.log
+          ! grep -q 'Which Language' sel.log
+          grep -q 'Audio rendition "Deutsch"' sel.log
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_sel.ts | sort -u | grep -q audio
+          # -A picks by LANGUAGE (case-insensitive, "DE" takes "de"), over DEFAULT=YES
+          sed 's/NAME="English",LANGUAGE="en"/NAME="English",LANGUAGE="en",DEFAULT=YES/' sel_master.m3u8 > sel_def.m3u8
+          timeout 60 ../build/hlsdl -v -b -A DE -f -o out_sel_a.ts sel_def.m3u8 < /dev/null 2>sel_a.log
+          grep -q 'Audio rendition "Deutsch"' sel_a.log
+          # DEFAULT=YES without URI = the audio inside the variant: no separate
+          # playlist is fetched (it used to take the only rendition with a URI)
+          printf '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Original",DEFAULT=YES\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Audiodeskription",URI="aplaylist.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=300000,AUDIO="a"\nvplaylist.m3u8\n' > sel_mux.m3u8
+          timeout 60 ../build/hlsdl -v -b -f -o out_sel_mux.ts sel_mux.m3u8 < /dev/null 2>sel_mux.log
+          grep -q '"Original" is part of the variant' sel_mux.log
+          ! ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_sel_mux.ts | grep -q audio
+      - name: fixture - master attributes after an empty value, blank line and tag before the URI
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # X="" used to end the attribute list (BANDWIDTH after it was lost, so
+          # -b took the other variant); the blank line became the variant URL
+          printf '#EXTM3U\n#EXT-X-STREAM-INF:CLOSED-CAPTIONS="",BANDWIDTH=300000,RESOLUTION=64x48\n\n#EXT-X-SOME-NEW-TAG:FOO=1\nrk_plain.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=100000\ndoes-not-exist.m3u8\n' > attr_master.m3u8
+          timeout 60 ../build/hlsdl -b -f -o out_attr.ts attr_master.m3u8 < /dev/null
+          cmp out_attr.ts ref_rk.ts
+      - name: fixture - -b leaves AV1 and Dolby Vision variants out
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          printf '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS="av01.0.08M.08,mp4a.40.2"\ndoes-not-exist.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS="dvh1.05.06,ec-3"\ndoes-not-exist.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=300000,CODECS="avc1.4d401f,mp4a.40.2"\nrk_plain.m3u8\n' > codec_master.m3u8
+          timeout 60 ../build/hlsdl -b -f -o out_codec.ts codec_master.m3u8 < /dev/null
+          cmp out_codec.ts ref_rk.ts
+          # nothing else there: the AV1 variant is still taken
+          printf '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS="av01.0.08M.08"\nrk_plain.m3u8\n' > codec_only.m3u8
+          timeout 60 ../build/hlsdl -b -f -o out_codec_only.ts codec_only.m3u8 < /dev/null
+          cmp out_codec_only.ts ref_rk.ts
+      - name: fixture - EXT-X-GAP segments are skipped, not fetched
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          hdr='#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n'
+          printf "$hdr"'#EXTINF:1.0,\nrk0.ts\n#EXTINF:1.0,\nrk2.ts\n#EXT-X-ENDLIST\n' > gap_ref.m3u8
+          printf "$hdr"'#EXTINF:1.0,\nrk0.ts\n#EXT-X-GAP\n#EXTINF:1.0,\nmissing.ts\n#EXTINF:1.0,\nrk2.ts\n#EXT-X-ENDLIST\n' > gap.m3u8
+          timeout 60 ../build/hlsdl -f -o ref_gap.ts gap_ref.m3u8
+          # with 30 retries per segment a fetched gap took >30 s and failed
+          timeout 15 ../build/hlsdl -f -o out_gap.ts gap.m3u8 2>gap.log
+          cat gap.log
+          grep -q 'gap (EXT-X-GAP)' gap.log
+          ! grep -q 'retry' gap.log
+          cmp out_gap.ts ref_gap.ts
+      - name: fixture - EXT-X-PLAYLIST-TYPE:VOD without EXT-X-ENDLIST is VOD
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nrk0.ts\n#EXTINF:1.0,\nrk1.ts\n' > vod_noend.m3u8
+          { cat vod_noend.m3u8; printf '#EXT-X-ENDLIST\n'; } > vod_end.m3u8
+          timeout 60 ../build/hlsdl -f -o ref_vod_end.ts vod_end.m3u8
+          # taken for live it waited for new segments until the timeout
+          timeout 20 ../build/hlsdl -f -o out_vod_noend.ts vod_noend.m3u8 2>vod_noend.log
+          grep -q '"d_t":"vod"' vod_noend.log
+          cmp out_vod_noend.ts ref_vod_end.ts
+      - name: fixture - a key request that fails once is retried
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:METHOD=AES-128,URI="flaky.key"\n#EXTINF:1.0,\nrk1.enc\n#EXT-X-ENDLIST\n' > flaky.m3u8
+          python3 - <<'EOF' &
+          import http.server
+          hits = {'n': 0}
+          class H(http.server.SimpleHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path.startswith('/flaky.key'):
+                      hits['n'] += 1
+                      if hits['n'] == 1:
+                          self.send_error(503)
+                          return
+                      self.path = '/k1.key'
+                  return super().do_GET()
+          http.server.ThreadingHTTPServer(('127.0.0.1', 8207), H).serve_forever()
+          EOF
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8207/flaky.m3u8 && break
+            sleep 0.5
+          done
+          # the key got a single try: one 503 failed the whole VOD download
+          rc=0
+          timeout 30 ../build/hlsdl -f -o out_flaky.ts "http://127.0.0.1:8207/flaky.m3u8" 2>flaky.log || rc=$?
+          kill $srv 2>/dev/null || true
+          cat flaky.log
+          test "$rc" -eq 0
+          grep -q 'retrying' flaky.log
+          cmp out_flaky.ts rk1.ts
+      - name: fixture - an unknown EXT-X-KEY METHOD fails instead of writing ciphertext
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # AES-256-GCM (HLS 2nd edition) is not supported: the segment used to be
+          # written as it is (no method in force before it) - ciphertext in the file
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nrk0.ts\n#EXT-X-KEY:METHOD=AES-256-GCM,URI="k1.key"\n#EXTINF:1.0,\nrk1.enc\n#EXT-X-ENDLIST\n' > gcm.m3u8
+          if timeout 30 ../build/hlsdl -f -o out_gcm.ts gcm.m3u8 2>gcm.log; then
+            cat gcm.log
+            echo "hlsdl reported success for an unsupported METHOD" >&2; exit 1
+          fi
+          cat gcm.log
+          grep -q 'Unsupported EXT-X-KEY METHOD=AES-256-GCM' gcm.log
+          grep -q '"error_msg":"encryption"' gcm.log
+          # only the clear segment in front of it made it into the file
+          cmp out_gcm.ts rk0.ts
+      - name: fixture - live stream restarted with lower media sequence numbers
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          test -e rk5.ts
+          live='#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n'
+          printf "$live"'#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:1.0,\nrk0.ts\n#EXTINF:1.0,\nrk1.ts\n#EXTINF:1.0,\nrk2.ts\n' > live_reset.m3u8
+          python3 -m http.server 8208 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8208/live_reset.m3u8 && break
+            sleep 0.5
+          done
+          timeout 60 ../build/hlsdl -f -s 30 -e 1 -o out_reset.ts "http://127.0.0.1:8208/live_reset.m3u8" 2>live_reset.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 102' live_reset.log && break
+            sleep 0.5
+          done
+          sleep 1
+          # the encoder starts over: numbers 0.. - hlsdl used to wait forever,
+          # nothing ever got past the old last number 102
+          printf "$live"'#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nrk3.ts\n#EXTINF:1.0,\nrk4.ts\n#EXTINF:1.0,\nrk5.ts\n' > live_reset.m3u8
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 2$' live_reset.log && break
+            sleep 0.5
+          done
+          printf '#EXT-X-ENDLIST\n' >> live_reset.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat live_reset.log
+          test "$rc" -eq 0
+          grep -q 'following the restarted stream' live_reset.log
+          grep -q 'Downloading part 0$' live_reset.log
+          grep -q 'Downloading part 2$' live_reset.log
+      - name: fixture - live start no closer to the end than three target durations
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nrk0.ts\n#EXTINF:1.0,\nrk1.ts\n#EXTINF:1.0,\nrk2.ts\n#EXTINF:1.0,\nrk3.ts\n#EXTINF:1.0,\nrk4.ts\n#EXTINF:1.0,\nrk5.ts\n' > live_edge.m3u8
+          python3 -m http.server 8209 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8209/live_edge.m3u8 && break
+            sleep 0.5
+          done
+          # -s 0 used to start at the very last segment
+          timeout 60 ../build/hlsdl -f -s 0 -e 1 -o out_edge.ts "http://127.0.0.1:8209/live_edge.m3u8" 2>live_edge.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part' live_edge.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXT-X-ENDLIST\n' >> live_edge.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat live_edge.log
+          test "$rc" -eq 0
+          test "$(grep -m1 -o 'Downloading part [0-9]*' live_edge.log)" = "Downloading part 3"
+      - name: fixture - EXT-X-DEFINE (NAME/VALUE, QUERYPARAM, IMPORT)
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # {$name} references used to be requested literally. The master
+          # passes the token of its own URL (QUERYPARAM) and a name (IMPORT) on
+          # to the media playlist, which also has a variable of its own in the
+          # quoted EXT-X-KEY URI, and an empty one (VALUE="" is valid).
+          printf '#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-DEFINE:NAME="v",VALUE="def_media"\n#EXT-X-DEFINE:NAME="seg",VALUE="rk"\n#EXT-X-DEFINE:QUERYPARAM="tok"\n#EXT-X-STREAM-INF:BANDWIDTH=300000\n{$v}.m3u8?tok={$tok}\n' > def_master.m3u8
+          printf '#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-DEFINE:IMPORT="seg"\n#EXT-X-DEFINE:QUERYPARAM="tok"\n#EXT-X-DEFINE:NAME="k",VALUE="k1"\n#EXT-X-DEFINE:NAME="e",VALUE=""\n#EXTINF:1.0,\n{$seg}{$e}0.ts?tok={$tok}\n#EXT-X-KEY:METHOD=AES-128,URI="{$k}.key?tok={$tok}"\n#EXTINF:1.0,\n{$seg}1.enc?tok={$tok}\n#EXT-X-ENDLIST\n' > def_media.m3u8
+          python3 -m http.server 8210 2>def_srv.log &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8210/def_master.m3u8 && break
+            sleep 0.5
+          done
+          rc=0
+          timeout 30 ../build/hlsdl -b -f -o out_def.ts "http://127.0.0.1:8210/def_master.m3u8?tok=abc123" < /dev/null || rc=$?
+          kill $srv 2>/dev/null || true
+          cat def_srv.log
+          test "$rc" -eq 0
+          # rk0 in the clear + rk1 decrypted with k1.key
+          cmp out_def.ts ref_vod_end.ts
+          grep -q 'GET /def_media.m3u8?tok=abc123 ' def_srv.log
+          grep -q 'GET /rk0.ts?tok=abc123 ' def_srv.log
+          grep -q 'GET /k1.key?tok=abc123 ' def_srv.log
+          grep -q 'GET /rk1.enc?tok=abc123 ' def_srv.log
+          ! grep -qiE '\{\$|%7B%24' def_srv.log
+      - name: fixture - EXT-X-DEFINE QUERYPARAM on live refreshes behind a redirect
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # the playlist URL carries the token, the server redirects to a path
+          # without query: the refresh used to read QUERYPARAM from the
+          # redirect target and request {$tok} literally from then on
+          printf '#EXTM3U\n#EXT-X-VERSION:8\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-DEFINE:QUERYPARAM="tok"\n#EXTINF:1.0,\nrk0.ts?tok={$tok}\n#EXTINF:1.0,\nrk1.ts?tok={$tok}\n' > lq_real.m3u8
+          python3 - <<'EOF' 2>lq_srv.log &
+          import http.server
+          class H(http.server.SimpleHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path.startswith('/lq.m3u8'):
+                      self.send_response(302)
+                      self.send_header('Location', '/lq_real.m3u8')
+                      self.end_headers()
+                      return
+                  return super().do_GET()
+          http.server.ThreadingHTTPServer(('127.0.0.1', 8211), H).serve_forever()
+          EOF
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8211/lq_real.m3u8 && break
+            sleep 0.5
+          done
+          timeout 60 ../build/hlsdl -f -s 30 -e 1 -o out_lq.ts "http://127.0.0.1:8211/lq.m3u8?tok=xyz" 2>lq.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 1' lq.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXTINF:1.0,\nrk2.ts?tok={$tok}\n' >> lq_real.m3u8
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 2' lq.log && break
+            sleep 0.5
+          done
+          printf '#EXT-X-ENDLIST\n' >> lq_real.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat lq.log lq_srv.log
+          test "$rc" -eq 0
+          grep -q 'GET /rk2.ts?tok=xyz ' lq_srv.log
+          ! grep -qiE '\{\$|%7B%24' lq_srv.log
+      - name: fixture - live restart with old segments still queued (404 now), separate audio
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          # old stream 100.. (slow server: segments 101, 102 are still queued
+          # when the restart is seen), new stream 0.. under new names; the old
+          # names answer 404 from then on. The queued old segments used to be
+          # retried -w times each, and old audio blocked the pairing.
+          for i in 0 1 2; do cp "v$i.ts" "nv$i.ts"; cp "a$i.ts" "na$i.ts"; done
+          hdr='#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n'
+          printf "$hdr"'#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:1.0,\nv0.ts\n#EXTINF:1.0,\nv1.ts\n#EXTINF:1.0,\nv2.ts\n' > rsv.m3u8
+          printf "$hdr"'#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:1.0,\na0.ts\n#EXTINF:1.0,\na1.ts\n#EXTINF:1.0,\na2.ts\n' > rsa.m3u8
+          rm -f restart_phase2
+          python3 - <<'EOF' 2>rs_srv.log &
+          import http.server, os, time
+          OLD = {'/v0.ts', '/v1.ts', '/v2.ts', '/a0.ts', '/a1.ts', '/a2.ts'}
+          class H(http.server.SimpleHTTPRequestHandler):
+              def do_GET(self):
+                  phase2 = os.path.exists('restart_phase2')
+                  if self.path.endswith('.ts'):
+                      if phase2 and self.path in OLD:
+                          self.send_error(404)
+                          return
+                      if not phase2:
+                          time.sleep(1.5)
+                  return super().do_GET()
+          http.server.ThreadingHTTPServer(('127.0.0.1', 8212), H).serve_forever()
+          EOF
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8212/rsv.m3u8 && break
+            sleep 0.5
+          done
+          timeout 90 ../build/hlsdl -f -s 30 -e 1 -a "http://127.0.0.1:8212/rsa.m3u8" \
+                 -o out_rs.ts "http://127.0.0.1:8212/rsv.m3u8" 2>rs.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 100' rs.log && break
+            sleep 0.5
+          done
+          touch restart_phase2
+          printf "$hdr"'#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nnv0.ts\n#EXTINF:1.0,\nnv1.ts\n#EXTINF:1.0,\nnv2.ts\n' > rsv.m3u8
+          printf "$hdr"'#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nna0.ts\n#EXTINF:1.0,\nna1.ts\n#EXTINF:1.0,\nna2.ts\n' > rsa.m3u8
+          for _ in $(seq 60); do
+            grep -q 'Downloading part 2$' rs.log && break
+            sleep 0.5
+          done
+          printf '#EXT-X-ENDLIST\n' >> rsv.m3u8
+          printf '#EXT-X-ENDLIST\n' >> rsa.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat rs.log
+          test "$rc" -eq 0
+          test "$(grep -c 'following the restarted stream' rs.log)" -eq 2
+          # neither the queued old segments nor the one being fetched at the restart
+          ! grep -qE 'Live retry segment 10[012]' rs.log
+          ! grep -q 'Downloading part 101' rs.log
+          grep -q 'Downloading part 0$' rs.log
+          ! grep -q 'keeps failing' rs.log
+          # every segment of the new stream has its audio
+          ! grep -qE 'No audio for segment [012] ' rs.log
+          apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 out_rs.ts | head -1 | cut -d, -f1)
+          test "$apk" -gt 20
+      - name: fixture - EXT-X-GAP in the fMP4 A/V mux
+        if: always()
+        run: |
+          set -eux
+          cd fx
+          seg2=$(grep '\.m4s$' fvid.m3u8 | sed -n 2p)
+          awk -v s="$seg2" '$0 == s { print "#EXT-X-GAP" } { print }' fvid.m3u8 > fvid_gap.m3u8
+          # the #EXTINF line belongs before the gap marker's segment - move the tag up
+          python3 - <<'EOF'
+          lines = open('fvid_gap.m3u8').read().split('\n')
+          out = []
+          for i, l in enumerate(lines):
+              if l == '#EXT-X-GAP' and out and out[-1].startswith('#EXTINF'):
+                  out.insert(len(out) - 1, l)
+              else:
+                  out.append(l)
+          open('fvid_gap.m3u8', 'w').write('\n'.join(out))
+          EOF
+          cat fvid_gap.m3u8
+          chmod 000 "$seg2"
+          rc=0
+          timeout 30 ../build/hlsdl -f -a faud.m3u8 -o fav_gap.mp4 fvid_gap.m3u8 2>fav_gap.log || rc=$?
+          chmod 644 "$seg2"
+          cat fav_gap.log
+          test "$rc" -eq 0
+          grep -q 'gap (EXT-X-GAP)' fav_gap.log
+          vpk=$(ffprobe -v error -select_streams v -count_packets -show_entries stream=nb_read_packets -of csv=p=0 fav_gap.mp4 | head -1 | cut -d, -f1)
+          apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 fav_gap.mp4 | head -1 | cut -d, -f1)
+          test "$vpk" -eq 100
+          test "$apk" -ge 280
+
+
+  # ---------------------------------------------------------- e2isubparser
+  # Old C (VLC / ffmpeg snippets from ~2015). Goal: it links into a loadable
+  # module and parses SRT + TTML (the TTML path goes through Expat).
+  e2isubparser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: install python dev headers
+        if: always()
+        run: sudo apt-get update && sudo apt-get -y install python3-dev
+      - name: make
+        run: make -C e2isubparser CFLAGS="-w"
+      - name: parse SRT and TTML (exercises Expat)
+        if: always()
+        working-directory: e2isubparser
+        env:
+          # abort + report on any heap corruption, so the huge-cue test below
+          # fails loudly if the markup buffer ever overflows again
+          MALLOC_CHECK_: "3"
+        run: |
+          python3 - <<'PY'
+          import _subparser
+          print("version:", _subparser.version())
+
+          srt = "1\n00:00:01,000 --> 00:00:02,000\nHello world\n\n"
+          r = _subparser.parse(srt, 0, 1, 1, 12, 138)
+          print("srt:", r)
+          assert r, "SRT parse returned nothing"
+
+          ttml = (
+              '<?xml version="1.0" encoding="UTF-8"?>'
+              '<tt xmlns="http://www.w3.org/ns/ttml">'
+              '<body><div>'
+              '<p begin="00:00:01.000" end="00:00:03.000">Ampersand &amp; entity</p>'
+              '<p begin="00:00:04.000" end="00:00:06.000">second cue</p>'
+              '</div></body></tt>'
+          )
+          r = _subparser.parse(ttml, 0, 1, 1, 12, 138)
+          print("ttml:", r)
+          assert r, "TTML parse returned nothing"
+
+          # a single cue far longer than the internal markup buffer, with
+          # lots of <b>/<font> tags and unterminated '<' - must not overflow
+          huge = ("1\n00:00:01,000 --> 00:00:05,000\n"
+                  + ("<b>x</b> <font size=\"20\">y</font> z <<<< " * 400)
+                  + "\n\n")
+          r = _subparser.parse(huge, 0, 1, 1, 12, 138)
+          print("huge cue len:", len(r["list"][0]["text"]))
+          assert r["list"], "huge SRT parse returned nothing"
+          assert len(r["list"][0]["text"]) < 4096, "markup buffer not bounded"
+
+          # a cue longer than the markup buffer, cut inside a multi-byte
+          # character, must still give a valid list (no NULL entry / error)
+          umlaut = "1\n00:00:01,000 --> 00:00:05,000\n" + ("\u00e4" * 3000) + "\n\n"
+          r = _subparser.parse(umlaut, 0, 1, 1, 12, 138)
+          assert r["list"] and isinstance(r["list"][0]["text"], str), "cut UTF-8 cue"
+
+          # a cue without end time: the last one must end after it starts
+          mdvd = "{25}{}first\n{50}{}last cue\n"
+          r = _subparser.parse(mdvd, 40000, 1, 1, 12, 138)
+          print("microdvd:", r)
+          last = r["list"][-1]
+          assert last["end"] > last["start"], "last cue ends before it starts"
+          PY
+      - name: parsers never loop forever
+        if: always()
+        working-directory: e2isubparser
+        run: |
+          python3 - <<'PY'
+          import multiprocessing as mp
+
+          def work(s, q):
+              import _subparser
+              q.put(_subparser.parse(s, 0, 1, 1, 12, 138))
+
+          def parse_with_timeout(s, sec=10):
+              q = mp.Queue()
+              p = mp.Process(target=work, args=(s, q))
+              p.start()
+              p.join(sec)
+              if p.is_alive():
+                  p.terminate()
+                  raise SystemExit("parser did not finish within %d s: %r" % (sec, s[:80]))
+              return q.get(timeout=5)
+
+          # several SAMI SYNC entries on one line used to repeat the first one forever
+          sami = "<SAMI><BODY><SYNC Start=1000><P>Hi<SYNC Start=2000><P>there<SYNC Start=3000><P>&nbsp;</BODY></SAMI>"
+          r = parse_with_timeout(sami)
+          print("sami:", r)
+          assert [c["start"] for c in r["list"]][:2] == [1000, 2000], "SAMI entries"
+
+          # malformed SRT-like input found by fuzzing (hung before the fix)
+          fuzz = (":199]:99:,799 -->: -1:00:00,&000\nx\n\n2001-> m3> \n\n:00:01,000 \n0:00:1-> > \n\n\n"
+                  "9,9[,99 --> -1:00:00,&00\nx\n\n26\n00:00:01,000 \n00:00:\\01-> m3> \n\n")
+          parse_with_timeout(fuzz)
+          print("fuzz case finished")
+
+  # ----------------------------------------------------------- cmdwrap / lsdir
