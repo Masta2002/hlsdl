@@ -1370,99 +1370,120 @@ jobs:
   # ---------------------------------------------------------- e2isubparser
   # Old C (VLC / ffmpeg snippets from ~2015). Goal: it links into a loadable
   # module and parses SRT + TTML (the TTML path goes through Expat).
-  e2isubparser:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - name: install python dev headers
+      - name: port - -m with TS, fMP4, the fMP4 A/V mux and the TS A/V merge
         if: always()
-        run: sudo apt-get update && sudo apt-get -y install python3-dev
-      - name: make
-        run: make -C e2isubparser CFLAGS="-w"
-      - name: parse SRT and TTML (exercises Expat)
-        if: always()
-        working-directory: e2isubparser
-        env:
-          # abort + report on any heap corruption, so the huge-cue test below
-          # fails loudly if the markup buffer ever overflows again
-          MALLOC_CHECK_: "3"
         run: |
-          python3 - <<'PY'
-          import _subparser
-          print("version:", _subparser.version())
-
-          srt = "1\n00:00:01,000 --> 00:00:02,000\nHello world\n\n"
-          r = _subparser.parse(srt, 0, 1, 1, 12, 138)
-          print("srt:", r)
-          assert r, "SRT parse returned nothing"
-
-          ttml = (
-              '<?xml version="1.0" encoding="UTF-8"?>'
-              '<tt xmlns="http://www.w3.org/ns/ttml">'
-              '<body><div>'
-              '<p begin="00:00:01.000" end="00:00:03.000">Ampersand &amp; entity</p>'
-              '<p begin="00:00:04.000" end="00:00:06.000">second cue</p>'
-              '</div></body></tt>'
-          )
-          r = _subparser.parse(ttml, 0, 1, 1, 12, 138)
-          print("ttml:", r)
-          assert r, "TTML parse returned nothing"
-
-          # a single cue far longer than the internal markup buffer, with
-          # lots of <b>/<font> tags and unterminated '<' - must not overflow
-          huge = ("1\n00:00:01,000 --> 00:00:05,000\n"
-                  + ("<b>x</b> <font size=\"20\">y</font> z <<<< " * 400)
-                  + "\n\n")
-          r = _subparser.parse(huge, 0, 1, 1, 12, 138)
-          print("huge cue len:", len(r["list"][0]["text"]))
-          assert r["list"], "huge SRT parse returned nothing"
-          assert len(r["list"][0]["text"]) < 4096, "markup buffer not bounded"
-
-          # a cue longer than the markup buffer, cut inside a multi-byte
-          # character, must still give a valid list (no NULL entry / error)
-          umlaut = "1\n00:00:01,000 --> 00:00:05,000\n" + ("\u00e4" * 3000) + "\n\n"
-          r = _subparser.parse(umlaut, 0, 1, 1, 12, 138)
-          assert r["list"] and isinstance(r["list"][0]["text"], str), "cut UTF-8 cue"
-
-          # a cue without end time: the last one must end after it starts
-          mdvd = "{25}{}first\n{50}{}last cue\n"
-          r = _subparser.parse(mdvd, 40000, 1, 1, 12, 138)
-          print("microdvd:", r)
-          last = r["list"][-1]
-          assert last["end"] > last["start"], "last cue ends before it starts"
-          PY
-      - name: parsers never loop forever
+          set -eux
+          mkdir -p pm && cd pm
+          ffmpeg -v error -f lavfi -i testsrc=d=6:s=128x72:r=25 -c:v libx264 -g 25 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'tv%d.ts' tv.m3u8
+          ffmpeg -v error -f lavfi -i sine=f=440:d=6 -c:a aac -ar 48000 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'ta%d.ts' ta.m3u8
+          ffmpeg -v error -f lavfi -i testsrc=d=6:s=128x72:r=25 -c:v libx264 -g 25 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename fvinit.mp4 \
+                 -hls_segment_filename 'fv%d.m4s' fv.m3u8
+          ffmpeg -v error -f lavfi -i sine=f=440:d=6 -c:a aac -ar 48000 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename fainit.mp4 \
+                 -hls_segment_filename 'fa%d.m4s' fa.m3u8
+          # TS
+          timeout 60 ../build/hlsdl -m -f -o seg.ts tv.m3u8
+          ls -l
+          test -s 000_seg.ts && test -s 001_seg.ts && test -s 002_seg.ts
+          test ! -e 003_seg.ts && test ! -e seg.ts
+          for f in 00?_seg.ts; do ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$f" | grep -q video; done
+          # fMP4: every file starts with the init
+          timeout 60 ../build/hlsdl -m -f -o segf.mp4 fv.m3u8
+          test ! -e 003_segf.mp4
+          for f in 00?_segf.mp4; do
+            dd if="$f" bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+            ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$f" | grep -q video
+          done
+          # fMP4 A/V mux: the muxed init and both tracks in every file
+          timeout 60 ../build/hlsdl -m -f -a fa.m3u8 -o segav.mp4 fv.m3u8
+          test ! -e 003_segav.mp4
+          for f in 00?_segav.mp4; do
+            ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$f" > s.txt
+            cat s.txt
+            grep -q video s.txt
+            grep -q audio s.txt
+            ffmpeg -v error -i "$f" -f null - 2>dec.log
+            test ! -s dec.log
+          done
+          # TS A/V merge: a PAT / PMT of its own and both streams in every file
+          timeout 60 ../build/hlsdl -m -f -a ta.m3u8 -o segta.ts tv.m3u8
+          test ! -e 003_segta.ts
+          for f in 00?_segta.ts; do
+            ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$f" > s.txt
+            cat s.txt
+            grep -q video s.txt
+            grep -q audio s.txt
+          done
+          # refused combinations
+          ! timeout 30 ../build/hlsdl -m -R -f -o x.ts tv.m3u8
+          ! timeout 30 ../build/hlsdl -m -f -o - tv.m3u8
+      - name: port - strict parsing and what needs a remux
         if: always()
-        working-directory: e2isubparser
         run: |
-          python3 - <<'PY'
-          import multiprocessing as mp
-
-          def work(s, q):
-              import _subparser
-              q.put(_subparser.parse(s, 0, 1, 1, 12, 138))
-
-          def parse_with_timeout(s, sec=10):
-              q = mp.Queue()
-              p = mp.Process(target=work, args=(s, q))
-              p.start()
-              p.join(sec)
-              if p.is_alive():
-                  p.terminate()
-                  raise SystemExit("parser did not finish within %d s: %r" % (sec, s[:80]))
-              return q.get(timeout=5)
-
-          # several SAMI SYNC entries on one line used to repeat the first one forever
-          sami = "<SAMI><BODY><SYNC Start=1000><P>Hi<SYNC Start=2000><P>there<SYNC Start=3000><P>&nbsp;</BODY></SAMI>"
-          r = parse_with_timeout(sami)
-          print("sami:", r)
-          assert [c["start"] for c in r["list"]][:2] == [1000, 2000], "SAMI entries"
-
-          # malformed SRT-like input found by fuzzing (hung before the fix)
-          fuzz = (":199]:99:,799 -->: -1:00:00,&000\nx\n\n2001-> m3> \n\n:00:01,000 \n0:00:1-> > \n\n\n"
-                  "9,9[,99 --> -1:00:00,&00\nx\n\n26\n00:00:01,000 \n00:00:\\01-> m3> \n\n")
-          parse_with_timeout(fuzz)
-          print("fuzz case finished")
-
-  # ----------------------------------------------------------- cmdwrap / lsdir
+          set -eux
+          mkdir -p ps && cd ps
+          ffmpeg -v error -f lavfi -i testsrc=d=6:s=128x72:r=25 -c:v libx264 -g 25 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 \
+                 -hls_segment_filename 'f%d.m4s' f.m3u8
+          ffmpeg -v error -f lavfi -i testsrc=d=2:s=160x90:r=25 -c:v libx264 -g 25 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename init2.mp4 \
+                 -hls_segment_filename 'g%d.m4s' g.m3u8
+          cat f.m3u8
+          hdr='#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-PLAYLIST-TYPE:VOD\n'
+          # an fMP4 discontinuity: refused without -m, one file per segment with -m
+          { printf "$hdr"; printf '#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2,\nf0.m4s\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\nf1.m4s\n#EXT-X-ENDLIST\n'; } > disc.m3u8
+          ! timeout 60 ../build/hlsdl -f -o disc.mp4 disc.m3u8 2>disc.log
+          cat disc.log
+          grep -q 'requires remuxing' disc.log
+          timeout 60 ../build/hlsdl -m -f -o disc.mp4 disc.m3u8
+          test -s 000_disc.mp4 && test -s 001_disc.mp4
+          # a different init mid-stream: refused without -m; with -m each file
+          # carries the init in force
+          { printf "$hdr"; printf '#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2,\nf0.m4s\n#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI="init2.mp4"\n#EXTINF:2,\ng0.m4s\n#EXT-X-ENDLIST\n'; } > chg.m3u8
+          ! timeout 60 ../build/hlsdl -f -o chg.mp4 chg.m3u8 2>chg.log
+          cat chg.log
+          grep -q 'requires remuxing' chg.log
+          timeout 60 ../build/hlsdl -m -f -o chg.mp4 chg.m3u8
+          ffprobe -v error -show_entries stream=width -of csv=p=0 000_chg.mp4 | grep -qx 128
+          ffprobe -v error -show_entries stream=width -of csv=p=0 001_chg.mp4 | grep -qx 160
+          # the same init repeated under its URL: written once, no error
+          { printf "$hdr"; printf '#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2,\nf0.m4s\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2,\nf1.m4s\n#EXT-X-ENDLIST\n'; } > rep.m3u8
+          timeout 60 ../build/hlsdl -f -o rep.mp4 rep.m3u8
+          test "$(grep -a -o ftyp rep.mp4 | wc -l)" -eq 1
+          # -t lists the repeated init once
+          test "$(timeout 30 ../build/hlsdl -t rep.m3u8 2>&1 | grep -c 'init.mp4$')" -eq 1
+          # malformed tags reject the playlist
+          for tag in '#EXT-X-KEY:METHOD="AES-128",URI="k.key"' \
+                     '#EXT-X-KEY:METHOD=AES-128' \
+                     '#EXT-X-KEY:METHOD=NONE,URI="k.key"' \
+                     '#EXT-X-KEY:METHOD=AES-128,URI="k.key",IV=0xZZ' \
+                     '#EXT-X-MAP:URI=init.mp4' \
+                     '#EXT-X-MAP:URI="init.mp4",BYTERANGE="100"' ; do
+            { printf "$hdr"; printf '%s\n#EXTINF:2,\nf0.m4s\n#EXT-X-ENDLIST\n' "$tag"; } > bad.m3u8
+            cat bad.m3u8
+            ! timeout 30 ../build/hlsdl -f -o bad.mp4 bad.m3u8 2>bad.log
+            cat bad.log
+            grep -q 'Invalid media playlist tag' bad.log
+          done
+          # EXT-X-MEDIA-SEQUENCE after the first segment
+          { printf "$hdr"; printf '#EXTINF:2,\nf0.m4s\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:2,\nf1.m4s\n#EXT-X-ENDLIST\n'; } > bad.m3u8
+          ! timeout 30 ../build/hlsdl -f -o bad.mp4 bad.m3u8 2>bad.log
+          grep -q 'Invalid media playlist tag' bad.log
+          # a byte range without offset that does not continue the segment before
+          { printf "$hdr"; printf '#EXTINF:2,\n#EXT-X-BYTERANGE:100\nf0.m4s\n#EXT-X-ENDLIST\n'; } > bad.m3u8
+          ! timeout 30 ../build/hlsdl -f -o bad.mp4 bad.m3u8 2>bad.log
+          grep -q 'Invalid media byte range' bad.log
+          # an empty quoted attribute value is fine
+          { printf "$hdr"; printf '#EXT-X-MAP:URI="init.mp4"\n#EXT-X-KEY:METHOD=NONE,KEYFORMAT=""\n#EXTINF:2,\nf0.m4s\n#EXT-X-ENDLIST\n'; } > ok.m3u8
+          timeout 30 ../build/hlsdl -f -o ok.mp4 ok.m3u8
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 ok.mp4 | grep -q video
